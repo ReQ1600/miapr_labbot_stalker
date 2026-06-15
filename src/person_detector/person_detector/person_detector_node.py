@@ -21,8 +21,17 @@ class PersonDetector(Node):
 
         self.sub = self.create_subscription(
             Image,
-            '/camera/image_raw',
+            '/camera/color/image_raw',
             self.image_callback,
+            10
+        )
+
+        self.depth_image = None
+
+        self.depth_sub = self.create_subscription(
+            Image,
+            '/camera/depth/image_raw',
+            self.depth_callback,
             10
         )
 
@@ -39,9 +48,17 @@ class PersonDetector(Node):
         self.last_time = self.get_clock().now()
         self.min_period = 0.1  # 10 Hz
 
+        self.fx = 570.3405082258201
+        self.fy = 570.3405082258201
+        self.ppx = 319.5
+        self.ppy = 239.5
+
         self.get_logger().info("YOLO person detector READY")
 
     def image_callback(self, msg):
+
+        if self.depth_image is None:
+            return
 
         now = self.get_clock().now()
         if (now - self.last_time).nanoseconds < self.min_period * 1e9:
@@ -62,8 +79,7 @@ class PersonDetector(Node):
             if name != "person":
                 continue
 
-            conf = float(box.conf[0])
-            if conf < 0.5:
+            if float(box.conf[0]) < 0.5:
                 continue
 
             x1, y1, x2, y2 = box.xyxy[0]
@@ -79,31 +95,54 @@ class PersonDetector(Node):
 
         x1, y1, x2, y2 = best_box
 
-        cx = float((x1 + x2) / 2)
-        cy = float((y1 + y2) / 2)
+        cx = int((x1 + x2) / 2)
+        cy = int((y1 + y2) / 2)
 
-        h, w, _ = frame.shape
+        h, w = self.depth_image.shape[:2]
 
-        nx = (cx - w / 2) / w
-        ny = (cy - h / 2) / h
+        if not (0 <= cx < w and 0 <= cy < h):
+            return
 
-        self.smooth_x = self.alpha * nx + (1 - self.alpha) * self.smooth_x
-        self.smooth_y = self.alpha * ny + (1 - self.alpha) * self.smooth_y
+        roi = self.depth_image[
+            max(0, cy - 5):min(h, cy + 5),
+            max(0, cx - 5):min(w, cx + 5)
+        ]
+
+        valid = roi[roi > 0]
+
+        if len(valid) == 0:
+            return
+
+        depth = float(np.median(valid))
+
+        # RealSense -> mm
+        if depth > 20:  # mm vs m
+            depth = depth / 1000.0
+
+        X = (cx - self.ppx) * depth / self.fx
+        Y = (cy - self.ppy) * depth / self.fy
+        Z = depth
 
         pose = PoseStamped()
-        pose.header.frame_id = "map"
         pose.header.stamp = self.get_clock().now().to_msg()
+        pose.header.frame_id = "camera_link"
 
-        pose.pose.position.x = float(self.smooth_x * 2.0)
-        pose.pose.position.y = float(self.smooth_y * 2.0)
+        pose.pose.position.x = float(Z)
+        pose.pose.position.y = float(-X)
         pose.pose.position.z = 0.0
-
         pose.pose.orientation.w = 1.0
 
         self.pub.publish(pose)
 
         self.get_logger().info(
-            f"Person goal: x={pose.pose.position.x:.2f}, y={pose.pose.position.y:.2f}"
+            f"Person: Z={Z:.2f}m, X={X:.2f}m"
+        )
+
+
+    def depth_callback(self, msg):
+        self.depth_image = self.bridge.imgmsg_to_cv2(
+            msg,
+            desired_encoding='passthrough'
         )
 
 
